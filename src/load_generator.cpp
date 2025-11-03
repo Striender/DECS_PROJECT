@@ -11,16 +11,41 @@
 using namespace std;
 
 atomic<long long> total_requests = 0;
+atomic<long long> total_failures = 0;
 atomic<bool> time_is_up = false;
-atomic<bool> server_is_down = false;
 
 vector<string> popular_keys = {
     "key0", "key1", "key2", "key3", "key4",
     "key5", "key6", "key7", "key8", "key9"};
 
+// Function to check if server is reachable before starting
+bool ping_server(string host, int port)
+{
+    try
+    {
+        httplib::Client cli(host, port);
+        cli.set_connection_timeout(2);
+        auto res = cli.Head("/kv?key=ping_test");
+        if (res)
+        {
+            return true;
+        }
+        else
+        {
+            return false;
+        }
+    }
+    catch (const std::exception &e)
+    {
+        return false;
+    }
+}
+
 void client_thread_function(string host, int port, string workload_type)
 {
     httplib::Client cli(host, port);
+
+    // Short timeouts are still good practice
     cli.set_connection_timeout(2);
     cli.set_read_timeout(2);
     cli.set_write_timeout(2);
@@ -28,9 +53,9 @@ void client_thread_function(string host, int port, string workload_type)
     std::random_device rd;
     std::mt19937 gen(rd());
     std::uniform_int_distribution<> popular_dis(0, 9);
-    std::uniform_int_distribution<> large_set_dis(1, 10000);
+    std::uniform_int_distribution<> large_set_dis(1, 15000);
 
-    while (!time_is_up && !server_is_down)
+    while (!time_is_up)
     {
         string url;
         httplib::Result res;
@@ -38,7 +63,7 @@ void client_thread_function(string host, int port, string workload_type)
         if (workload_type == "popular")
         {
             string key_to_get = popular_keys[popular_dis(gen)];
-            url = "/kv?key=" + key_to_get;
+            url = "/kv_popular?key=" + key_to_get;
             res = cli.Get(url.c_str());
         }
         else if (workload_type == "get")
@@ -56,15 +81,29 @@ void client_thread_function(string host, int port, string workload_type)
 
         if (res)
         {
-            if (res->status == 200 || res->status == 404)
+            if (workload_type == "popular" && res->status == 200)
             {
                 total_requests++;
+            }
+            else if (workload_type == "get")
+            {
+                if (res->status == 200 || res->status == 404)
+                {
+                    total_requests++;
+                }
+            }
+            else if (workload_type == "put" && res->status == 200)
+            {
+                total_requests++;
+            }
+            else
+            {
+                total_failures++;
             }
         }
         else
         {
-            // If res is false, a connection error occurred
-            server_is_down = true;
+            total_failures++;
         }
     }
 }
@@ -88,9 +127,19 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    // Make sure these match your server!
     string host = "127.0.0.1";
     int port = 8080;
+
+    cout << "Pinging server at " << host << ":" << port << "..." << endl;
+    if (!ping_server(host, port))
+    {
+        cerr << "\nError: Unable to connect to the server." << endl;
+        cerr << "Please ensure the server is running on " << host << ":" << port << endl;
+        return 1;
+    }
+    cout << "Server connection successful." << endl;
+
+    // --- NO CACHE WARM-UP ---
 
     vector<thread> threads;
     cout << "Starting '" << workload_type << "' workload with " << num_threads << " threads for " << duration << " seconds..." << endl;
@@ -100,41 +149,32 @@ int main(int argc, char *argv[])
         threads.emplace_back(client_thread_function, host, port, workload_type);
     }
 
-    // --- THIS IS THE UPDATED LOGIC ---
-    // Sleep in 1-second naps and check if the server died
     cout << "Test running..." << endl;
-    for (int i = 0; i < duration; i++)
-    {
-        if (server_is_down)
-        {
-            cout << "Connection to server lost! Stopping test early." << endl;
-            break; // Exit the sleep loop immediately
-        }
-        this_thread::sleep_for(chrono::seconds(1));
-    }
-    // --- END OF UPDATED LOGIC ---
 
-    time_is_up = true; // Tell all threads to stop
+    this_thread::sleep_for(chrono::seconds(duration));
+    int actual_duration_ran = duration;
 
-    cout << "Time is up. Waiting for threads to finish..." << endl;
+    time_is_up = true;
+
+    cout << "Time is up. Detaching threads and calculating results..." << endl;
+
+    // --- THIS IS THE FIX ---
+    // We replace join() with detach()
+    // This will stop the main thread from waiting.
     for (auto &th : threads)
     {
-        th.join();
+        th.detach(); // <-- CHANGED FROM join()
     }
+    // --- END OF FIX ---
 
-    if (server_is_down)
-    {
-        cout << "\nWARNING: Test stopped early because the server connection was lost." << endl;
-    }
-
-    // Calculate throughput based on how long the test *actually* ran
-    // This is a more complex calculation, but for now, we'll just report the raw numbers.
-    double throughput = static_cast<double>(total_requests) / duration;
+    double throughput = static_cast<double>(total_requests) / actual_duration_ran;
 
     cout << "\n--- Results ---" << endl;
     cout << "Workload: " << workload_type << endl;
+    cout << "Test ran for: " << actual_duration_ran << " seconds" << endl;
     cout << "Total requests completed: " << total_requests << endl;
-    cout << "Throughput: " << throughput << " requests/second (based on full duration)" << endl;
+    cout << "Total requests failed (timeout/error): " << total_failures << endl;
+    cout << "Throughput: " << throughput << " successful requests/second" << endl;
 
-    return 0;
+    return 0; // Main thread exits, OS kills all detached threads.
 }
