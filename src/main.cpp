@@ -9,6 +9,7 @@
 #include <mutex>
 #include <list>
 #include <unordered_map>
+#include <thread> // For std::this_thread::get_id()
 
 #include <mysql_connection.h>
 #include <cppconn/driver.h>
@@ -24,13 +25,11 @@ list<pair<string, string>> lru_list;
 unordered_map<string, list<pair<string, string>>::iterator> cache_map;
 mutex cache_mutex;
 mutex db_mutex;
-
-// --- NEW: A single, global database connection ---
 sql::Connection *global_con;
 
 // --- Helper function to read the config file ---
 map<string, string> read_config(const string &filename)
-{ /* ... (Same as before) ... */
+{
     map<string, string> config;
     ifstream config_file(filename);
     string line;
@@ -60,46 +59,38 @@ void move_to_back(const string &key)
     lru_list.splice(lru_list.end(), lru_list, cache_map[key]);
 }
 
-void add_to_cache(const string &key, const string &value)
+void add_to_cache(const string &key, const string &value, const thread::id &tid)
 {
     if (cache_map.size() >= MAX_CACHE_SIZE)
     {
         string lru_key = lru_list.front().first;
         lru_list.pop_front();
         cache_map.erase(lru_key);
-        // cout << "  [CACHE EVICT] Evicted key: " << lru_key << endl;
+        cout << "[CACHE EVICT] Evicted key: " << lru_key << endl;
     }
     lru_list.push_back({key, value});
     cache_map[key] = --lru_list.end();
-    // cout << "  [CACHE] Stored key: " << key << endl;
+    cout << "[CACHE] Stored key: " << key << endl;
 }
 
 // --- Database Function (CREATE/UPDATE) ---
-// --- UPDATED: No longer takes db_config, as it uses the global connection ---
-bool save_to_database(const string &key, const string &value)
+bool save_to_database(const string &key, const string &value, const thread::id &tid)
 {
-    lock_guard<mutex> db_guard(db_mutex); // Lock the database first
+    lock_guard<mutex> db_guard(db_mutex);
     try
     {
-        // --- REMOVED: All connection logic (driver, connect, etc.) ---
         sql::PreparedStatement *pstmt;
-
-        // --- UPDATED: Use the global connection ---
         pstmt = global_con->prepareStatement("INSERT INTO kv_pairs(item_key, item_value) VALUES(?, ?) ON DUPLICATE KEY UPDATE item_value = VALUES(item_value)");
-
         pstmt->setString(1, key);
         pstmt->setString(2, value);
         pstmt->executeUpdate();
         delete pstmt;
-        // --- DO NOT delete the connection ---
     }
     catch (const exception &e)
     {
         cerr << "DATABASE ERROR (save): " << e.what() << endl;
         return false;
     }
-
-    // Now update the cache
     lock_guard<mutex> cache_guard(cache_mutex);
     if (cache_map.count(key))
     {
@@ -108,36 +99,32 @@ bool save_to_database(const string &key, const string &value)
     }
     else
     {
-        add_to_cache(key, value);
+        add_to_cache(key, value, tid);
     }
     return true;
 }
 
 // --- Database Function (READ) ---
-// --- UPDATED: No longer takes db_config ---
-string get_from_database(const string &key)
+pair<int, string> get_from_database(const string &key, const thread::id &tid)
 {
     {
         lock_guard<mutex> cache_guard(cache_mutex);
         if (cache_map.count(key))
         {
-            // cout << "  [CACHE HIT] Found key: " << key << endl;
+            cout << "[CACHE HIT] Found key: " << key << endl;
             move_to_back(key);
-            return cache_map[key]->second;
+            return {200, cache_map[key]->second};
         }
     }
 
-    // cout << "  [CACHE MISS] Key not found, checking DB for: " << key << endl;
+    cout << "[CACHE MISS] Key not found, checking DB for: " << key << endl;
 
     string value = "";
     lock_guard<mutex> db_guard(db_mutex);
     try
     {
-        // --- REMOVED: All connection logic ---
         sql::PreparedStatement *pstmt;
         sql::ResultSet *res;
-
-        // --- UPDATED: Use the global connection ---
         pstmt = global_con->prepareStatement("SELECT item_value FROM kv_pairs WHERE item_key = ?");
         pstmt->setString(1, key);
         res = pstmt->executeQuery();
@@ -152,29 +139,29 @@ string get_from_database(const string &key)
     catch (const exception &e)
     {
         cerr << "DATABASE ERROR (get): " << e.what() << endl;
-        return "";
+        return {500, ""}; // 500 on database error
     }
 
     if (!value.empty())
     {
         lock_guard<mutex> cache_guard(cache_mutex);
-        add_to_cache(key, value);
+        add_to_cache(key, value, tid);
+        return {200, value};
     }
-    return value;
+    else
+    {
+        return {404, ""}; // 404 Not Found
+    }
 }
 
 // --- Database Function (DELETE) ---
-// --- UPDATED: No longer takes db_config ---
-bool delete_from_database(const string &key)
+int delete_from_database(const string &key, const thread::id &tid)
 {
     lock_guard<mutex> db_guard(db_mutex);
     int update_count = 0;
     try
     {
-        // --- REMOVED: All connection logic ---
         sql::PreparedStatement *pstmt;
-
-        // --- UPDATED: Use the global connection ---
         pstmt = global_con->prepareStatement("DELETE FROM kv_pairs WHERE item_key = ?");
         pstmt->setString(1, key);
         update_count = pstmt->executeUpdate();
@@ -183,7 +170,7 @@ bool delete_from_database(const string &key)
     catch (const exception &e)
     {
         cerr << "DATABASE ERROR (delete): " << e.what() << endl;
-        return false;
+        return 500; // 500 on database error
     }
 
     if (update_count > 0)
@@ -193,21 +180,24 @@ bool delete_from_database(const string &key)
         {
             lru_list.erase(cache_map[key]);
             cache_map.erase(key);
-            // cout << "  [CACHE] Deleted key: " << key << endl;
+            cout << "[CACHE] Deleted key: " << key << endl;
         }
-        return true;
+        return 200;
     }
-    return false;
+    else
+    {
+        return 404;
+    }
 }
 
-// --- HTTP Handlers (PERFORMANCE VERSION) ---
-// --- UPDATED: All logging is removed from handlers for max performance ---
+// --- HTTP Handlers ---
 void create_key_handler(const httplib::Request &req, httplib::Response &res)
 {
+    auto tid = this_thread::get_id();
     string key = req.get_param_value("key");
     string value = req.body;
     cout << "Received request to create key: " << key << endl;
-    bool success = save_to_database(key, value);
+    bool success = save_to_database(key, value, tid);
     if (success)
     {
         res.set_content("Successfully saved the key.", "text/plain");
@@ -220,53 +210,70 @@ void create_key_handler(const httplib::Request &req, httplib::Response &res)
 }
 void read_key_handler(const httplib::Request &req, httplib::Response &res)
 {
+    auto tid = this_thread::get_id();
     string key = req.get_param_value("key");
     cout << "Received request to read key: " << key << endl;
-    string value = get_from_database(key);
-    if (!value.empty())
+
+    auto result = get_from_database(key, tid);
+    int status = result.first;
+    string value = result.second;
+
+    if (status == 200)
     {
         res.set_content(value, "text/plain");
     }
-    else
+    else if (status == 404)
     {
         res.set_content("Key not found.", "text/plain");
         res.status = 404;
     }
+    else
+    {
+        res.set_content("Internal server error.", "text/plain");
+        res.status = 500;
+    }
 }
 void delete_key_handler(const httplib::Request &req, httplib::Response &res)
 {
+    auto tid = this_thread::get_id();
     string key = req.get_param_value("key");
     cout << "Received request to delete key: " << key << endl;
-    bool success = delete_from_database(key);
-    if (success)
+
+    int status = delete_from_database(key, tid);
+
+    if (status == 200)
     {
         res.set_content("Key successfully deleted.", "text/plain");
     }
-    else
+    else if (status == 404)
     {
         res.set_content("Key not found or error during deletion.", "text/plain");
         res.status = 404;
     }
+    else
+    {
+        res.set_content("Internal server error.", "text/plain");
+        res.status = 500;
+    }
 }
 void popular_read_handler(const httplib::Request &req, httplib::Response &res)
 {
+    auto tid = this_thread::get_id();
     string key = req.get_param_value("key");
     cout << "Received popular request for key: " << key << endl;
 
     lock_guard<mutex> cache_guard(cache_mutex);
     if (cache_map.count(key))
     {
-        // --- CACHE HIT ---
-        cout << "  [CACHE HIT] Found popular key: " << key << endl;
-        move_to_back(key); // Mark as recently used
+        cout << "[CACHE HIT] Found popular key: " << key << endl;
+        move_to_back(key);
         string value = cache_map[key]->second;
         res.set_content(value, "text/plain");
         res.status = 200;
     }
     else
     {
-        // --- CACHE MISS ---
-        cout << "  [CACHE MISS] Popular key not in cache: " << key << endl;
+        cout << "[CACHE MISS] Popular key not in cache: " << key << endl;
         res.set_content("Key not found in cache.", "text/plain");
         res.status = 404;
     }
@@ -281,7 +288,6 @@ int main(void)
         return 1;
     }
 
-    // --- NEW: Create the single, shared DB connection on startup ---
     try
     {
         sql::Driver *driver;
@@ -295,7 +301,6 @@ int main(void)
         cerr << "FATAL: Could not connect to database on startup: " << e.what() << endl;
         return 1;
     }
-    // --- END OF NEW BLOCK ---
 
     httplib::Server svr;
 
@@ -308,8 +313,18 @@ int main(void)
     svr.Get("/kv_popular", [&](const httplib::Request &req, httplib::Response &res)
             { popular_read_handler(req, res); });
 
-    cout << "Server with " << MAX_CACHE_SIZE << "-item LRU cache starting on port 8080" << endl;
-    svr.listen("0.0.0.0", 8080);
+    cout << "Server with " << MAX_CACHE_SIZE << "-item LRU cache. Starting on port 9090" << endl;
+
+    // --- THIS IS THE CRITICAL FIX ---
+
+    if (!svr.listen("0.0.0.0", 9090))
+    {
+        cerr << "\nFATAL ERROR: Server failed to listen on 0.0.0.0:9090" << endl;
+        cerr << "This is most likely a port conflict. Check with 'sudo lsof -i :9090'" << endl;
+        delete global_con;
+        return 1;
+    }
+    // --- END OF FIX ---
 
     delete global_con;
     return 0;

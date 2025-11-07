@@ -13,10 +13,9 @@ using namespace std;
 atomic<long long> total_requests = 0;
 atomic<long long> total_failures = 0;
 atomic<bool> time_is_up = false;
+atomic<long long> total_response_time_ms = 0; // To sum up response times
 
-vector<string> popular_keys = {
-    "key0", "key1", "key2", "key3", "key4",
-    "key5", "key6", "key7", "key8", "key9"};
+// --- REMOVED popular_keys vector ---
 
 // Function to check if server is reachable before starting
 bool ping_server(string host, int port)
@@ -45,14 +44,13 @@ void client_thread_function(string host, int port, string workload_type)
 {
     httplib::Client cli(host, port);
 
-    // Short timeouts are still good practice
     cli.set_connection_timeout(2);
     cli.set_read_timeout(2);
     cli.set_write_timeout(2);
 
     std::random_device rd;
     std::mt19937 gen(rd());
-    std::uniform_int_distribution<> popular_dis(0, 9);
+    // --- REMOVED popular_dis ---
     std::uniform_int_distribution<> large_set_dis(1, 15000);
 
     while (!time_is_up)
@@ -60,42 +58,102 @@ void client_thread_function(string host, int port, string workload_type)
         string url;
         httplib::Result res;
 
-        if (workload_type == "popular")
-        {
-            string key_to_get = popular_keys[popular_dis(gen)];
-            url = "/kv_popular?key=" + key_to_get;
-            res = cli.Get(url.c_str());
-        }
-        else if (workload_type == "get")
+        auto start_time = chrono::steady_clock::now(); // Start timer
+
+        if (workload_type == "get")
         {
             string key = "key_" + to_string(large_set_dis(gen));
             url = "/kv?key=" + key;
             res = cli.Get(url.c_str());
         }
-        else // "put"
+        else if (workload_type == "put") // This is the "Put all" (POST/DELETE mix)
         {
             string key = "key_" + to_string(large_set_dis(gen));
             url = "/kv?key=" + key;
-            res = cli.Post(url.c_str(), "some_random_value", "text/plain");
+
+            if (large_set_dis(gen) % 2 == 0)
+            {
+                res = cli.Post(url.c_str(), "some_random_value", "text/plain");
+            }
+            else
+            {
+                res = cli.Delete(url.c_str());
+            }
         }
+        else // --- NEW: "mix" workload (Get+Put) ---
+        {
+            string key = "key_" + to_string(large_set_dis(gen));
+            url = "/kv?key=" + key;
+
+            // Randomly choose 0 (GET), 1 (POST), or 2 (DELETE)
+            int choice = large_set_dis(gen) % 3;
+
+            if (choice == 0)
+            {
+                // Do a GET
+                res = cli.Get(url.c_str());
+            }
+            else if (choice == 1)
+            {
+                // Do a POST
+                res = cli.Post(url.c_str(), "some_random_value", "text/plain");
+            }
+            else
+            {
+                // Do a DELETE
+                res = cli.Delete(url.c_str());
+            }
+        }
+        // --- END OF NEW LOGIC ---
+
+        auto end_time = chrono::steady_clock::now(); // Stop timer
 
         if (res)
         {
-            if (workload_type == "popular" && res->status == 200)
-            {
-                total_requests++;
-            }
-            else if (workload_type == "get")
+            auto duration_ms = chrono::duration_cast<chrono::milliseconds>(end_time - start_time).count();
+
+            // --- REMOVED 'popular' workload logic ---
+
+            if (workload_type == "get")
             {
                 if (res->status == 200 || res->status == 404)
                 {
                     total_requests++;
+                    total_response_time_ms += duration_ms;
+                }
+                else
+                {
+                    total_failures++;
                 }
             }
-            else if (workload_type == "put" && res->status == 200)
+            else if (workload_type == "put")
             {
-                total_requests++;
+                if (res->status == 200)
+                {
+                    total_requests++;
+                    total_response_time_ms += duration_ms;
+                }
+                else
+                {
+                    total_failures++;
+                }
             }
+            // --- NEW: Success logic for "mix" ---
+            else if (workload_type == "mix")
+            {
+                // We'll count any 200 (POST, GET-hit, DELETE-hit)
+                // or 404 (GET-miss, DELETE-miss) as a successful operation.
+                if (res->status == 200 || res->status == 404)
+                {
+                    total_requests++;
+                    total_response_time_ms += duration_ms;
+                }
+                else
+                {
+                    total_failures++;
+                }
+            }
+            // --- END OF NEW LOGIC ---
             else
             {
                 total_failures++;
@@ -112,8 +170,9 @@ int main(int argc, char *argv[])
 {
     if (argc != 4)
     {
+        // --- UPDATED Usage Message ---
         cerr << "Usage: ./load_generator <num_threads> <duration_seconds> <workload_type>" << endl;
-        cerr << "  workload_type can be 'popular', 'get', or 'put'" << endl;
+        cerr << "  workload_type can be 'get', 'put', or 'mix'" << endl;
         return 1;
     }
 
@@ -121,14 +180,15 @@ int main(int argc, char *argv[])
     int duration = stoi(argv[2]);
     string workload_type = argv[3];
 
-    if (workload_type != "popular" && workload_type != "get" && workload_type != "put")
+    // --- UPDATED Workload Check ---
+    if (workload_type != "get" && workload_type != "put" && workload_type != "mix")
     {
-        cerr << "Invalid workload type. Choose 'popular', 'get', or 'put'." << endl;
+        cerr << "Invalid workload type. Choose 'get', 'put', or 'mix'." << endl;
         return 1;
     }
 
     string host = "127.0.0.1";
-    int port = 8080;
+    int port = 9090;
 
     cout << "Pinging server at " << host << ":" << port << "..." << endl;
     if (!ping_server(host, port))
@@ -158,16 +218,18 @@ int main(int argc, char *argv[])
 
     cout << "Time is up. Detaching threads and calculating results..." << endl;
 
-    // --- THIS IS THE FIX ---
-    // We replace join() with detach()
-    // This will stop the main thread from waiting.
     for (auto &th : threads)
     {
-        th.detach(); // <-- CHANGED FROM join()
+        th.detach();
     }
-    // --- END OF FIX ---
 
+    // Calculate both metrics
     double throughput = static_cast<double>(total_requests) / actual_duration_ran;
+    double avg_response_time = 0.0;
+    if (total_requests > 0)
+    {
+        avg_response_time = static_cast<double>(total_response_time_ms) / total_requests;
+    }
 
     cout << "\n--- Results ---" << endl;
     cout << "Workload: " << workload_type << endl;
@@ -175,6 +237,7 @@ int main(int argc, char *argv[])
     cout << "Total requests completed: " << total_requests << endl;
     cout << "Total requests failed (timeout/error): " << total_failures << endl;
     cout << "Throughput: " << throughput << " successful requests/second" << endl;
+    cout << "Average response time: " << avg_response_time << " ms" << endl;
 
-    return 0; // Main thread exits, OS kills all detached threads.
+    return 0;
 }
