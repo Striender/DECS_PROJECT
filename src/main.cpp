@@ -9,8 +9,6 @@
 #include <mutex>
 #include <list>
 #include <unordered_map>
-#include <thread> // For std::this_thread::get_id()
-
 #include <mysql_connection.h>
 #include <cppconn/driver.h>
 #include <cppconn/exception.h>
@@ -20,7 +18,7 @@
 using namespace std;
 
 // --- Global Cache and Mutexes ---
-const size_t MAX_CACHE_SIZE = 1000;
+const size_t MAX_CACHE_SIZE = 100;
 list<pair<string, string>> lru_list;
 unordered_map<string, list<pair<string, string>>::iterator> cache_map;
 mutex cache_mutex;
@@ -279,7 +277,7 @@ void popular_read_handler(const httplib::Request &req, httplib::Response &res)
     }
 }
 
-// --- Main Function ---
+
 int main(void)
 {
     auto db_config = read_config("db.conf");
@@ -315,7 +313,7 @@ int main(void)
 
     cout << "Server with " << MAX_CACHE_SIZE << "-item LRU cache. Starting on port 9090" << endl;
 
-    // --- THIS IS THE CRITICAL FIX ---
+    
 
     if (!svr.listen("0.0.0.0", 9090))
     {
@@ -324,7 +322,7 @@ int main(void)
         delete global_con;
         return 1;
     }
-    // --- END OF FIX ---
+    
 
     delete global_con;
     return 0;
